@@ -1,0 +1,395 @@
+name:infra-build-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+- None
+
+pool: $(buildagentpool)
+
+variables:
+- group: common-variable
+- group: dpnp-npd-build
+- name: TERRAFORM_VERSION
+  value: '1.13.1'
+- name: TF_INSTALL_DIR
+  value: '/devops/tools/terraform'
+- name: TF_PKG_DIR
+  value: '$(Pipeline.Workspace)/terraform_pkg'
+
+
+steps:
+- task: Bash@3
+  displayName: 'Debug: List and show test files in modules/rg/tests'
+  inputs:
+    targetType: 'inline'
+    script: |
+      echo "Listing files in $(System.DefaultWorkingDirectory)/modules/rg/tests:"
+      ls -l $(System.DefaultWorkingDirectory)/modules/rg/tests
+      echo "\nContents of *.tftest.hcl files:"
+      cat $(System.DefaultWorkingDirectory)/modules/rg/tests/*.tftest.hcl || echo "No .tftest.hcl files found"
+
+- task: Bash@3
+  displayName: 'Debug: List and show test files in tf_runtime/dataprotection/npd/tests'
+  inputs:
+    targetType: 'inline'
+    script: |
+      echo "Listing files in $(System.DefaultWorkingDirectory)/tf_runtime/dataprotection/npd/tests:"
+      ls -l $(System.DefaultWorkingDirectory)/tf_runtime/dataprotection/npd/tests
+      echo "\nContents of *.tftest.hcl files:"
+      cat $(System.DefaultWorkingDirectory)/tf_runtime/dataprotection/npd/tests/*.tftest.hcl || echo "No .tftest.hcl files found"
+
+- task: SonarQubePrepare@7
+  inputs:
+    SonarQube: 'sonarqube_bk_svc'
+    scannerMode: 'CLI'
+    configMode: 'manual'
+    cliProjectKey: 'au.gov.rba.it:iac'
+    cliProjectName: 'IT-Common-IAC'
+    cliSources: '.'
+- task: SonarQubeAnalyze@7
+- task: SonarQubePublish@7
+  inputs:
+    pollingTimeoutSec: '300'
+- task: sonar-buildbreaker@8
+  inputs:
+    SonarQube: 'sonarqube_bk_svc'
+
+- task: JfrogCliV2@1
+  displayName: 'To download the latest artifacts from Artifactory'
+  inputs:
+    jfrogPlatformConnection: '$(artifactorysvcconnectionv2)'
+    command: 'jf rt dl "generic-packages/fortify/" --sort-by=created --sort-order=desc --limit=1'
+
+- task: Bash@3
+  inputs:
+    targetType: 'inline'
+    script: |
+      cd $(System.DefaultWorkingDirectory)/fortify/
+      mv * /devops/tools/fortify/fortify_rule
+      cd /devops/tools/fortify/fortify_rule
+      unzip -u 'Fortify*.zip'
+      chmod 775 *
+      chown -R AzDevOps:docker *
+
+- task: FortifySCA@7
+  inputs:
+    licenseFile: '/devops/tools/fortify/fortify.license'
+    applicationType: 'other'
+    fortifyBuildId: 'BK.Infra'
+    scaVerbose: true
+    scaDebug: true
+    fortifyScanType: 'LocalScan'
+    customFortifyRulepacks: '/devops/tools/fortify/fortify_rule'
+    runFortifyUpload: true
+    fortifyServerName: 'fortify_generic_svc'
+    fortifyApplicationName: 'IT-CommonLZ-IAC'
+    fortifyApplicationVersion: '1.0'
+
+
+
+
+#===Install Terraform v1.13.1 as POC (Temp as when build agent got the latest terraform version installed we can remove this block)
+# 0) Detect agent OS/arch and set Terraform platform variables
+- task: Bash@3
+  displayName: 'Detect agent OS/arch for Terraform'
+  condition: succeeded()
+  inputs:
+    targetType: 'inline'
+    script: |
+      set -euo pipefail
+
+      OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+      ARCH=$(uname -m)
+
+      case "$OS" in
+        linux)   TF_OS=linux ;;
+        darwin)  TF_OS=darwin ;;
+        msys*|mingw*|cygwin*) TF_OS=windows ;;
+        *) echo "Unsupported OS: $OS"; exit 1 ;;
+      esac
+
+      case "$ARCH" in
+        x86_64|amd64) TF_ARCH=amd64 ;;
+        aarch64|arm64) TF_ARCH=arm64 ;;
+        armv7l) TF_ARCH=arm ;;
+        *) echo "Unsupported ARCH: $ARCH"; exit 1 ;;
+      esac
+
+      TF_OSARCH="${TF_OS}_${TF_ARCH}"
+      TF_EXPECTED_FILE="terraform_${TERRAFORM_VERSION}_${TF_OSARCH}.zip"
+      if [ "$TF_OS" = "windows" ]; then TF_BIN_NAME="terraform.exe"; else TF_BIN_NAME="terraform"; fi
+
+      echo "Detected OS: $OS ; ARCH: $ARCH ; Terraform platform: $TF_OSARCH"
+      echo "##vso[task.setvariable variable=TERRAFORM_OSARCH]$TF_OSARCH"
+      echo "##vso[task.setvariable variable=TF_EXPECTED_FILE]$TF_EXPECTED_FILE"
+      echo "##vso[task.setvariable variable=TF_BIN_NAME]$TF_BIN_NAME"
+
+# 1) Prepare package directory
+- task: Bash@3
+  displayName: 'Prepare Terraform package directory'
+  condition: succeeded()
+  inputs:
+    targetType: 'inline'
+    script: |
+      set -euo pipefail
+      mkdir -p "$(TF_PKG_DIR)"
+      echo "TF_PKG_DIR: $(TF_PKG_DIR)"
+      echo "TERRAFORM_VERSION: $(TERRAFORM_VERSION)"
+      echo "TERRAFORM_OSARCH: $(TERRAFORM_OSARCH)"
+      echo "TF_EXPECTED_FILE: $(TF_EXPECTED_FILE)"
+      echo "TF_BIN_NAME: $(TF_BIN_NAME)"
+
+# 2) Try Artifactory download (positional target dir). If nothing found, the task 'succeeds' but downloads 0 files.
+- task: JfrogCliV2@1
+  displayName: 'Download Terraform from Artifactory'
+  condition: succeeded()
+  inputs:
+    jfrogPlatformConnection: '$(artifactorysvcconnectionv2)'
+    command: >
+      jf rt dl
+      "generic-packages/terraform/terraform_$(TERRAFORM_VERSION)_$(TERRAFORM_OSARCH).zip"
+      --flat=true
+      "$(TF_PKG_DIR)/"
+
+# 3) Check if ZIP exists. If not, try fallback from HashiCorp
+- task: Bash@3
+  displayName: 'Verify Terraform package; fallback if missing'
+  condition: succeeded()
+  inputs:
+    targetType: 'inline'
+    script: |
+      set -euo pipefail
+
+      EXPECTED_PATH="$(TF_PKG_DIR)/$(TF_EXPECTED_FILE)"
+      echo "Expected ZIP: $EXPECTED_PATH"
+
+      if [ -f "$EXPECTED_PATH" ]; then
+        echo "OK: Found $EXPECTED_PATH via Artifactory."
+        echo "##vso[task.setvariable variable=TF_ZIP_READY]true"
+        exit 0
+      fi
+
+      echo "WARNING: Terraform ZIP not found in Artifactory at $(TF_EXPECTED_FILE)."
+      echo "Listing $(TF_PKG_DIR):"
+      ls -la "$(TF_PKG_DIR)" || true
+
+      # --- Fallback to HashiCorp releases (only if your org allows external download) ---
+      HASHI_URL="https://releases.hashicorp.com/terraform/$(TERRAFORM_VERSION)/$(TF_EXPECTED_FILE)"
+      echo "Attempting fallback download from: $HASHI_URL"
+      if curl -fsSL "$HASHI_URL" -o "$EXPECTED_PATH"; then
+        echo "Fallback download succeeded: $EXPECTED_PATH"
+        echo "##vso[task.setvariable variable=TF_ZIP_READY]true"
+      else
+        echo "ERROR: Terraform $(TERRAFORM_VERSION) $(TERRAFORM_OSARCH) not found in Artifactory and fallback download failed (blocked or unavailable)."
+        echo "##vso[task.setvariable variable=TF_ZIP_READY]false"
+        exit 1
+      fi
+
+# 4) Install Terraform and expose path (only if ZIP is ready)
+- task: Bash@3
+  displayName: 'Install Terraform and expose path'
+  condition: and(succeeded(), eq(variables.TF_ZIP_READY, 'true'))
+  inputs:
+    targetType: 'inline'
+    script: |
+      set -euo pipefail
+      set -x
+
+      ZIP_FILE="$(TF_PKG_DIR)/$(TF_EXPECTED_FILE)"
+      INSTALL_BASE="${TF_INSTALL_DIR:-/devops/tools/terraform}"
+      INSTALL_DIR="$INSTALL_BASE/bin"
+      BIN_NAME="$(TF_BIN_NAME)"
+
+      mkdir -p "$INSTALL_DIR"
+
+      if [ ! -f "$ZIP_FILE" ]; then
+        echo "ERROR: Not found: $ZIP_FILE"
+        exit 1
+      fi
+
+      echo "Installing Terraform from: $ZIP_FILE -> $INSTALL_DIR"
+      unzip -o "$ZIP_FILE" -d "$INSTALL_DIR"
+
+      chmod 0755 "$INSTALL_DIR/$BIN_NAME" || true
+      chown -R AzDevOps:docker "$INSTALL_BASE" || true
+
+      echo "Terraform installed at: $INSTALL_DIR/$BIN_NAME"
+      echo "Agent kernel/arch: $(uname -s) $(uname -m)"
+      file "$INSTALL_DIR/$BIN_NAME" || true
+
+      "$INSTALL_DIR/$BIN_NAME" version
+
+      # Expose to later tasks
+      echo "##vso[task.prependpath]$INSTALL_DIR"
+      echo "##vso[task.setvariable variable=TERRAFORM_EXE]$INSTALL_DIR/$BIN_NAME"
+
+# 5) Show resolved path & version
+- task: Bash@3
+  displayName: 'Show Terraform path & version'
+  condition: succeeded()
+  inputs:
+    targetType: 'inline'
+    script: |
+      echo "TERRAFORM_EXE: $(TERRAFORM_EXE)"
+      which terraform || true
+      terraform version || true
+
+
+
+# - task: Bash@3
+#   displayName: terraform initialization with remote state
+#   inputs:
+#     targetType: 'inline'
+#     script: |
+#       export ARM_USE_MSI=true
+#       export ARM_CLIENT_ID=$(arm_client_id)
+#       export ARM_TENANT_ID=$(arm_tenant_id) 
+#       export ARM_SUBSCRIPTION_ID=$(arm_subscription_id)
+#       terraform init -backend-config=$(System.DefaultWorkingDirectory)/pipelines/identity/npd/backend.conf
+#     workingDirectory: '$(moduleworkingdirectory)'
+
+# #To rename the main.tf file which contain the terraform cloud block at initial phase
+# - task: Bash@3
+#   displayName:  migration to terraform cloud
+#   inputs:
+#     targetType: 'inline'
+#     script: |
+#       mv $(System.DefaultWorkingDirectory)/tf_runtime/identity/npd/main.tf $(System.DefaultWorkingDirectory)/tf_runtime/identity/npd/main.tf.az
+#       mv $(System.DefaultWorkingDirectory)/tf_runtime/identity/npd/main.tf.hcp $(System.DefaultWorkingDirectory)/tf_runtime/identity/npd/main.tf
+#       ls -lart $(System.DefaultWorkingDirectory)/tf_runtime/identity/npd/
+
+                  
+- task: Bash@3
+  displayName: Retrieve Key Vault Secret
+  inputs:
+   targetType: 'inline'
+   script: |
+     az login --identity --resource-id /subscriptions/$(subscription)/resourceGroups/$(rg)/providers/Microsoft.ManagedIdentity/userAssignedIdentities/$(infraidentity)
+     SECRET_VALUE=`(az keyvault secret show --name "$(kvsecretname)" --vault-name "$(keyvault)" --query "value" --output tsv |base64 -d)`
+     echo "##vso[task.setvariable variable=SECRET_VALUE;isOutput=true;issecret=true]$SECRET_VALUE"
+  name: apikey
+
+- task: Bash@3 
+  displayName: terraform initialization with HCP state
+  inputs:
+     targetType: 'inline'
+     script: |
+        api_key=$(apikey.SECRET_VALUE)
+        export TF_TOKEN_app_terraform_io=$api_key
+        export ARM_USE_MSI=true
+        export ARM_CLIENT_ID=$(arm_client_id)
+        export ARM_TENANT_ID=$(arm_tenant_id) 
+        export ARM_SUBSCRIPTION_ID=$(arm_subscription_id)        
+        $(TERRAFORM_EXE) init     
+     workingDirectory: '$(moduleworkingdirectory)'
+
+- task: Bash@3
+  displayName: terraform validation for code syntax check
+  inputs:
+    targetType: 'inline'
+    script: |
+      export TF_TOKEN_app_terraform_io=$(apikey.SECRET_VALUE)
+      $(TERRAFORM_EXE) validate
+    workingDirectory: '$(moduleworkingdirectory)'
+
+# POC: Terraform unit testing
+- task: Bash@3
+  displayName: terraform test for unit testing
+  inputs:
+    targetType: 'inline'
+    script: |
+      export ARM_USE_MSI=true
+      export ARM_CLIENT_ID=$(arm_client_id)
+      export ARM_TENANT_ID=$(arm_tenant_id) 
+      export ARM_SUBSCRIPTION_ID=$(arm_subscription_id)    
+      export TF_TOKEN_app_terraform_io=$(apikey.SECRET_VALUE)
+
+      REPO_ROOT="$(System.DefaultWorkingDirectory)"
+      RESULTS_DIR="$REPO_ROOT/_tf_test_results/modules"
+      mkdir -p "$RESULTS_DIR"
+      JUNIT_OUT="$RESULTS_DIR/terraform-tests.xml"
+      $(TERRAFORM_EXE) test -junit-xml="$JUNIT_OUT" -no-color
+    workingDirectory: '$(moduleworkingdirectory)'
+
+# POC: Terraform unit testing - Publish JUnit results to Azure DevOps (both module + root)
+- task: PublishTestResults@2
+  displayName: 'Publish Terraform test results (JUnit)'
+  condition: always()
+  inputs:
+    testResultsFormat: 'JUnit'
+    testResultsFiles: '$(System.DefaultWorkingDirectory)/_tf_test_results/**/*.xml'
+    searchFolder: '$(System.DefaultWorkingDirectory)'
+    mergeTestResults: true
+    testRunTitle: 'Terraform Tests'
+    failTaskOnFailedTests: true
+
+- task: Bash@3
+  displayName: terraform plan execution for dry run
+  inputs:
+    targetType: 'inline'
+    script: |
+      export ARM_USE_MSI=true
+      export ARM_CLIENT_ID=$(arm_client_id)
+      export ARM_TENANT_ID=$(arm_tenant_id) 
+      export ARM_SUBSCRIPTION_ID=$(arm_subscription_id)    
+      export TF_TOKEN_app_terraform_io=$(apikey.SECRET_VALUE)
+      $(TERRAFORM_EXE) plan
+    workingDirectory: '$(moduleworkingdirectory)'
+
+
+
+
+
+- task: Bash@3
+  displayName: preparation for build artifacts
+  inputs:
+    targetType: 'inline'
+    script: |
+      echo "zipping the artifacts"
+      current_time=$(date '+%Y%m%d-%H%M%S')
+      echo "##vso[task.setvariable variable=current_time;isOutput=true]$current_time"
+      cd $(System.DefaultWorkingDirectory)
+      rm -rf $(tempbuildworkingdir)
+      mkdir -p /devops/commonlz/build/dpnp/npd
+      cp -r modules tf_runtime $(tempbuildworkingdir)/
+      cd $(tempbuildworkingdir)
+      rm -rf tf_runtime/connectivity tf_runtime/management tf_runtime/identity tf_runtime/dataprotection/prd
+      rm -rf *.zip
+      zip -r dpnp_npd_build-$current_time.zip * -x ".git" @
+  name: preparation 
+
+- task: JFrogGenericArtifacts@1
+  displayName: upload the build artifacts to jfrog artifactory
+  inputs:
+    command: 'Upload'
+    connection: '$(artifactorysvcconnection)'
+    specSource: 'taskConfiguration'
+    fileSpec: |
+      {
+        "files": [
+          {
+            "pattern": "$(tempbuildworkingdir)/dpnp_npd_build-$(preparation.current_time).zip",
+            "target": "$(jfrogartifactorypath)"
+          }
+        ]
+      }
+    collectBuildInfo: true
+    buildName: '$(Build.DefinitionName)'
+    buildNumber: '$(Build.BuildNumber)'
+    failNoOp: true
+    insecureTls: true
+
+- task: JFrogPublishBuildInfo@1
+  displayName: publish build info to jfrog artifactory
+  inputs:
+    artifactoryConnection: '$(artifactorysvcconnection)'
+    buildName: '$(Build.DefinitionName)'
+    buildNumber: '$(Build.BuildNumber)'
+
+- task: Bash@3
+  displayName: Clean temporary workspace
+  inputs:
+    targetType: 'inline'
+    script: |
+      echo "Cleaning the temporary workspace for next build"
+      echo "---------------------------------------------------"
+      rm -rf $(tempbuildworkingdir)/*
